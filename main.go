@@ -2,15 +2,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
-	"math/big"
 	"net"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -22,8 +24,8 @@ type CIDR struct {
 
 // ScanResult holds the result of a scan
 type ScanResult struct {
-	IP     string
-	Open   bool
+	IP   string
+	Open bool
 }
 
 func main() {
@@ -32,7 +34,7 @@ func main() {
 	outputFile := "rdp_live.txt"
 	concurrency := 100
 	timeout := 2 * time.Second
-	maxCIDR := 0 // 0 = no limit, skip CIDRs smaller than this (e.g., 20 skips /20 and larger networks)
+	maxCIDR := 0 // 0 = no limit, skip CIDRs with prefix smaller than this (e.g., 20 skips /19, /16, ...)
 
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -78,6 +80,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// A6: handle SIGINT/SIGTERM so partial results are saved instead of lost.
+	// First signal: stop new probes, save what was found, exit 130.
+	// Second signal: exit immediately with 130.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var interrupted atomic.Bool
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		for range sigCh {
+			if interrupted.CompareAndSwap(false, true) {
+				fmt.Fprintln(os.Stderr, "[!] Interrupted — writing partial results")
+				cancel()
+			} else {
+				os.Exit(130)
+			}
+		}
+	}()
+
 	// Read and parse CIDRs
 	fmt.Println("[*] Loading CIDRs...")
 	cidrs, err := readCIDRs(inputFile, maxCIDR)
@@ -97,29 +118,37 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Sort IPs for consistent output
-	sort.Strings(ips)
+	// A5: numeric sort (uint32 compare) for deterministic, human-sensible order
+	sort.Slice(ips, func(i, j int) bool { return ips[i] < ips[j] })
 
 	// Scan
 	fmt.Printf("[*] Scanning TCP/3389 (concurrency: %d, timeout: %s)...\n", concurrency, timeout)
-	results := scanIPs(ips, concurrency, timeout)
+	results := scanIPs(ctx, ips, concurrency, timeout)
 
-	// Filter open and print
+	// Filter open hosts
 	var openIPs []string
-	openCount := 0
 	for _, r := range results {
 		if r.Open {
 			openIPs = append(openIPs, r.IP)
-			openCount++
 			fmt.Printf("[+] %s:3389 OPEN\n", r.IP)
 		}
 	}
 
+	if interrupted.Load() {
+		// A6: persist the hosts discovered so far, then exit 130
+		if err := saveResults(openIPs, outputFile); err != nil {
+			fmt.Fprintf(os.Stderr, "error saving results: %v\n", err)
+		} else {
+			fmt.Printf("[+] %d partial result(s) saved to: %s\n", len(openIPs), outputFile)
+		}
+		os.Exit(130)
+	}
+
 	fmt.Printf("[+] Scan complete\n")
-	fmt.Printf("[+] %d RDP host(s) found\n", openCount)
+	fmt.Printf("[+] %d RDP host(s) found\n", len(openIPs))
 
 	// Save results
-	if openCount > 0 {
+	if len(openIPs) > 0 {
 		if err := saveResults(openIPs, outputFile); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving results: %v\n", err)
 		} else {
@@ -142,7 +171,8 @@ Options:
   -o, --output      Output file for found hosts (default: rdp_live.txt)
   -c, --concurrency Number of concurrent TCP checks (default: 100)
   -t, --timeout     TCP connection timeout (default: 2s, e.g., 500ms, 2s)
-  --max-cidr        Skip CIDRs smaller than this prefix (e.g., 20 skips /20 and larger networks)
+  --max-cidr        Skip CIDRs whose prefix is smaller than N.
+                    Example: --max-cidr 24 scans only /24 and smaller.
   -h, --help        Show this help message
 
 Input file format:
@@ -181,10 +211,10 @@ func readCIDRs(filename string, maxCIDR int) ([]CIDR, error) {
 			continue
 		}
 		if cidr, ok := parseCIDR(line); ok {
-			// Skip large CIDRs if maxCIDR is set
+			// Skip large CIDRs if maxCIDR is set (prefix strictly smaller than the threshold)
 			if maxCIDR > 0 && cidr.Mask < maxCIDR {
 				totalIPs := uint64(1) << uint(32-cidr.Mask)
-				fmt.Fprintf(os.Stderr, "[!] Skipping %s/%d (%d IPs) - use --max-cidr to change threshold\n", 
+				fmt.Fprintf(os.Stderr, "[!] Skipping %s/%d (%d IPs) - use --max-cidr to change threshold\n",
 					cidr.IP.String(), cidr.Mask, totalIPs)
 				continue
 			}
@@ -217,98 +247,99 @@ func parseCIDR(s string) (CIDR, bool) {
 	return CIDR{IP: ip.To4(), Mask: mask}, true
 }
 
-// expandCIDRs expands CIDR ranges to unique IP addresses
-func expandCIDRs(cidrs []CIDR) []string {
-	// Use a map for deduplication
-	ipSet := make(map[string]struct{})
-	
-	totalIPs := 0
+// ipToUint32 converts an IPv4 address to its uint32 representation
+func ipToUint32(ip net.IP) uint32 {
+	ip4 := ip.To4()
+	return uint32(ip4[0])<<24 | uint32(ip4[1])<<16 |
+		uint32(ip4[2])<<8 | uint32(ip4[3])
+}
+
+// uint32ToIP converts a uint32 to dotted-quad IPv4 string
+func uint32ToIP(n uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d",
+		byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+}
+
+// expandCIDRs expands CIDR ranges to unique IPs as uint32 values.
+// A3: progress fires inside the inner loop, every 100k iterations of the
+// current CIDR, so a single large CIDR reports progress while expanding.
+func expandCIDRs(cidrs []CIDR) []uint32 {
+	ipSet := make(map[uint32]struct{})
+
+	totalIPs := uint64(0)
+	reportEvery := uint64(100_000)
 	for _, cidr := range cidrs {
-		start := ipToBigInt(cidr.IP)
-		hostBits := 32 - cidr.Mask
-		count := uint64(1) << uint(hostBits)
-		
-		current := new(big.Int).Set(start)
-		one := big.NewInt(1)
-		
+		hostBits := uint(32 - cidr.Mask)
+		count := uint64(1) << hostBits
+		// Normalize to the network address (clear host bits)
+		mask := ^uint32(0) << hostBits
+		start := ipToUint32(cidr.IP) & mask
+
 		for i := uint64(0); i < count; i++ {
-			ipStr := bigIntToIP(current)
-			ipSet[ipStr] = struct{}{}
-			current.Add(current, one)
+			ipSet[start+uint32(i)] = struct{}{}
+			if (i+1)%reportEvery == 0 {
+				fmt.Fprintf(os.Stderr,
+					"[*] Expanding: %d/%d in current CIDR, %d unique total\n",
+					i+1, count, len(ipSet))
+			}
 		}
-		totalIPs += int(count)
-		
-		if len(ipSet)%100000 == 0 {
-			fmt.Fprintf(os.Stderr, "[*] Expanding... %d unique IPs so far\n", len(ipSet))
-		}
+		totalIPs += count
 	}
-	
-	// Convert map to sorted slice
-	ips := make([]string, 0, len(ipSet))
+
+	ips := make([]uint32, 0, len(ipSet))
 	for ip := range ipSet {
 		ips = append(ips, ip)
 	}
-	
+
 	fmt.Fprintf(os.Stderr, "[*] Expanded %d total IPs from %d CIDRs\n", totalIPs, len(cidrs))
 	return ips
 }
 
-func ipToBigInt(ip net.IP) *big.Int {
-	ip = ip.To4()
-	if ip == nil {
-		return big.NewInt(0)
-	}
-	return big.NewInt(0).SetBytes(ip)
-}
-
-func bigIntToIP(n *big.Int) string {
-	bytes := n.Bytes()
-	// Pad to 4 bytes
-	if len(bytes) < 4 {
-		padded := make([]byte, 4)
-		copy(padded[4-len(bytes):], bytes)
-		bytes = padded
-	}
-	return fmt.Sprintf("%d.%d.%d.%d", bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
-func scanIPs(ips []string, concurrency int, timeout time.Duration) []ScanResult {
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+// scanIPs probes TCP/3389 for every IP using a fixed worker pool of
+// `concurrency` goroutines reading from a shared jobs channel. No
+// goroutine-per-IP: memory stays O(concurrency) regardless of range size.
+func scanIPs(ctx context.Context, ips []uint32, concurrency int, timeout time.Duration) []ScanResult {
 	results := make([]ScanResult, len(ips))
+	jobs := make(chan int, concurrency*2)
+	var wg sync.WaitGroup
 	var processed atomic.Int64
 	total := int64(len(ips))
 
-	// Create semaphore for bounded concurrency
-	sem := make(chan struct{}, concurrency)
-
-	for i, ip := range ips {
+	for w := 0; w < concurrency; w++ {
 		wg.Add(1)
-		go func(idx int, ipAddr string) {
+		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			for idx := range jobs {
+				n := ips[idx]
+				ipStr := uint32ToIP(n)
+				result := ScanResult{IP: ipStr}
+				if ctx.Err() == nil {
+					addr := net.JoinHostPort(ipStr, "3389")
+					conn, err := net.DialTimeout("tcp", addr, timeout)
+					if err == nil {
+						conn.Close()
+						result.Open = true
+					}
+				}
+				// Each index is written by exactly one worker: no lock needed
+				results[idx] = result
 
-			result := ScanResult{IP: ipAddr}
-			addr := net.JoinHostPort(ipAddr, "3389")
-			conn, err := net.DialTimeout("tcp", addr, timeout)
-			if err == nil {
-				conn.Close()
-				result.Open = true
+				processed.Add(1)
+				// Print progress every 500 or at completion
+				if processed.Load()%500 == 0 || processed.Load() == total {
+					fmt.Printf("[*] Progress: %d/%d (%.1f%%)\n",
+						processed.Load(), total, float64(processed.Load())/float64(total)*100)
+				}
 			}
-
-			mu.Lock()
-			results[idx] = result
-			mu.Unlock()
-
-			processed.Add(1)
-			// Print progress every 500 or at completion
-			if processed.Load()%500 == 0 || processed.Load() == total {
-				fmt.Printf("[*] Progress: %d/%d (%.1f%%)\n", 
-					processed.Load(), total, float64(processed.Load())/float64(total)*100)
-			}
-		}(i, ip)
+		}()
 	}
+
+	go func() {
+		for i := range ips {
+			jobs <- i
+		}
+		close(jobs)
+	}()
 
 	wg.Wait()
 	return results

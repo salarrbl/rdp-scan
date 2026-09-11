@@ -40,7 +40,7 @@ go build -o rdp-scan .
 | `-o, --output` | Output file for found hosts | `rdp_live.txt` |
 | `-c, --concurrency` | Number of concurrent TCP checks | `100` |
 | `-t, --timeout` | TCP connection timeout (e.g., `500ms`, `2s`) | `2s` |
-| `--max-cidr` | Skip CIDRs smaller than this prefix (e.g., `20` skips /20 and larger networks) | `0` (no skip) |
+| `--max-cidr` | Skip CIDRs whose prefix is smaller than N. Example: `--max-cidr 24` scans only /24 and smaller. | `0` (no skip) |
 
 ### Input File Format
 
@@ -104,7 +104,7 @@ Choose concurrency based on your available resources:
 
 ## Performance Tips
 
-1. **Use `--max-cidr`** to skip large ranges that would take too long. For example, `--max-cidr 20` skips /20, /19, /16, etc.
+1. **Use `--max-cidr`** to skip large ranges that would take too long. For example, `--max-cidr 20` skips networks with a prefix smaller than 20 (/19, /16, etc.) and still scans /20 and smaller.
 2. **Lower concurrency** on slower networks or shared machines.
 3. **Shorter timeout** (`-t 500ms`) for faster scans when you expect most hosts to be unreachable.
 4. **Longer timeout** (`-t 5s`) for networks with higher latency.
