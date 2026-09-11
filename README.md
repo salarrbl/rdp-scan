@@ -1,159 +1,233 @@
-# RDP Exposure Scanner
+# rdp-scan
 
-Lightweight CLI tool for authorized corporate penetration testing. Discovers live RDP (TCP/3389) hosts from CIDR ranges.
+Lightweight RDP exposure scanner. Feeds CIDR ranges, finds live TCP/3389
+hosts, fingerprints them with an X.224 RDP negotiation handshake, and
+emits the results to stdout or a file.
+
+Built for authorized penetration testing and security assessments only.
 
 ## Features
 
-- CIDR range expansion with deduplication and overlap handling
-- TCP/3389 connectivity testing (no nmap, no UDP, no brute force)
-- Bounded concurrency with configurable worker pool
-- Configurable TCP timeout
-- Progress tracking
-- Graceful handling of malformed input
+- Fast concurrent TCP/3389 scanning with a fixed worker pool
+- **RDP fingerprinting**: distinguishes real RDP servers from any other
+  service on port 3389 using the X.224 Connection Request, and reports
+  the negotiated NLA posture
+- Streaming pipeline: memory stays bounded by the number of CIDRs, not
+  the number of IPs — a /8 scans with the same footprint as a /24
+- Overlapping and adjacent CIDRs are merged, so every address is probed
+  exactly once
+- Structured output: `txt`, `jsonl`, `csv`, or `targets` (RavenRDP-ready)
+- `--only-nla-open` for the recon-to-audit pipeline
+- Results on stdout, progress on stderr — safe to pipe and redirect
+- Graceful Ctrl+C: partial results are kept, exit code 130
 - Single binary, zero external dependencies
 
 ## Installation
 
-```bash
-go build -o rdp-scan main.go
-```
-
-Or with Go modules:
+Build from source with [Go](https://go.dev/):
 
 ```bash
-go mod init rdp-scan
-go mod tidy
-go build -o rdp-scan .
+git clone https://github.com/salarrbl/rdp-scan.git
+cd rdp-scan
+make build
 ```
+
+Or install directly:
+
+```bash
+go install ./cmd/rdp-scan
+```
+
+The binary is single-file and needs no runtime dependencies.
 
 ## Usage
 
-```bash
-./rdp-scan <input> [options]
+```
+rdp-scan <input> [options]
 ```
 
 ### Arguments
 
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `<input>` | Path to file containing CIDR ranges | Required |
-| `-o, --output` | Output file for found hosts | `rdp_live.txt` |
-| `-c, --concurrency` | Number of concurrent TCP checks | `100` |
-| `-t, --timeout` | TCP connection timeout (e.g., `500ms`, `2s`) | `2s` |
+| Argument | Description |
+|----------|-------------|
+| `<input>` | Path to file containing CIDR ranges |
+
+### Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-o`, `--output` | Output file for results (results go to stdout when omitted) | `stdout` |
+| `-c`, `--concurrency` | Number of concurrent probes | `100` |
+| `-t`, `--timeout` | Probe timeout, e.g., `500ms`, `2s` | `2s` |
 | `--max-cidr` | Skip CIDRs whose prefix is smaller than N. Example: `--max-cidr 24` scans only /24 and smaller. | `0` (no skip) |
+| `--format` | Output format: `txt`, `jsonl`, `csv`, `targets` | `txt` |
+| `--only-nla-open` | Only report hosts with NLA not enforced | `off` |
+| `-h`, `--help` | Show help message | |
 
 ### Input File Format
 
 One CIDR per line:
 
-```text
+```
+# Corporate subnets
 1.0.1.0/24
 1.0.2.0/23
-# This is a comment
-1.0.8.0/21
-
-1.0.32.0/19
+203.0.113.0/30
 ```
 
-Blank lines and lines starting with `#` are ignored. Malformed entries are skipped with a warning.
+Lines starting with `#` and blank lines are ignored. Malformed entries
+are skipped with a warning on stderr.
 
-## Examples
-
-### Basic scan
-
-```bash
-./rdp-scan ranges.txt
-```
-
-### With custom output and concurrency
+### Examples
 
 ```bash
+# Scan and print IPs to stdout (redirect to a file if you like)
+./rdp-scan ranges.txt > live.txt
+
+# Save to a file with more workers
 ./rdp-scan ranges.txt -o results.txt -c 200
-```
 
-### Quick scan with lower concurrency
+# Emit RavenRDP targets for hosts with NLA not enforced
+./rdp-scan ranges.txt --format targets --only-nla-open -o live.txt
 
-```bash
+# Short timeouts for dead ranges
 ./rdp-scan ranges.txt -c 50 -t 1s
-```
 
-### Skip large ranges (only scan /24 and smaller)
-
-```bash
+# Skip anything larger than /24
 ./rdp-scan ranges.txt --max-cidr 24
 ```
 
-### Large-scale scan with conservative resources
+## RDP fingerprinting
 
-```bash
-./rdp-scan cn-i-ranges.txt -c 100 -t 2s --max-cidr 20
-```
+A live TCP port is not necessarily RDP — proxies, VPN concentrators, and
+other services sometimes listen on 3389. rdp-scan fingerprints each open
+port with the standard RDP negotiation handshake:
 
-## Concurrency Guidelines
+1. TCP connect to the address on port 3389.
+2. Send the 19-byte X.224 **Connection Request** carrying an
+   `RDP_NEG_REQ` (protocol bits `0x00000000`).
+3. Read up to 64 bytes of the response with the same deadline.
+4. If the reply is an X.224 Disconnect Request carrying an
+   `RDP_NEG_RSP`, the selected protocol (little-endian, bytes 15–18 of
+   the packet) maps to an NLA posture:
 
-Choose concurrency based on your available resources:
+| Protocol bits | NLA value | Meaning |
+|---------------|-----------|---------|
+| `0x00000000` | `not-enforced` | TLS without NLA — pre-authentication is possible, which is why this is the interesting class for auditing (e.g., with [RavenRDP](https://github.com/0x6c/RavenRDP)) |
+| `0x00000002` | `required` | NLA enforced |
+| `0x00000008` | `hybrid-ex` | NLA with TLS hybrid |
+| anything else | `unknown` | RDP responded, but with an unexpected protocol selection |
 
-| CPU Cores | Suggested Concurrency | Notes |
-|-----------|----------------------|-------|
-| 2 | 50-100 | Low impact |
-| 4 | 100-200 | Balanced |
-| 8 | 200-500 | Aggressive |
-| 16+ | 500-1000 | Maximum throughput |
-
-**Start conservative.** If you see high CPU/memory usage, reduce `--concurrency`. A good rule of thumb: start with `concurrency = cores * 25` and adjust up or down based on system response.
-
-## Performance Tips
-
-1. **Use `--max-cidr`** to skip large ranges that would take too long. For example, `--max-cidr 20` skips networks with a prefix smaller than 20 (/19, /16, etc.) and still scans /20 and smaller.
-2. **Lower concurrency** on slower networks or shared machines.
-3. **Shorter timeout** (`-t 500ms`) for faster scans when you expect most hosts to be unreachable.
-4. **Longer timeout** (`-t 5s`) for networks with higher latency.
+If the port is open but the service does not answer with an X.224
+response (e.g., a plain HTTP server on 3389), the result is reported
+with `rdp=false` and a short `err` reason in structured formats. A
+connection that is refused or times out is reported as closed and is not
+an error.
 
 ## Output
 
-Found hosts are printed to stdout as they're discovered:
+Results are the **only** writes to stdout; every progress, warning, and
+error line goes to stderr. Progress on a TTY overwrites a single line
+every 250ms (percent, done/total, open count, rate, ETA); off-TTY it
+prints one line per 5000 completions.
 
-```text
-[+] 1.0.1.14:3389 OPEN
-[+] 1.0.1.72:3389 OPEN
+### `txt` (default)
+
+One IP per line:
+
+```
+1.12.34.56
+10.0.1.42
 ```
 
-Results are saved to the output file:
+### `targets`
 
-```text
-1.0.1.14
-1.0.1.72
+`host:port` per line, ready for RavenRDP's `targets.txt`:
+
+```
+1.12.34.56:3389
+10.0.1.42:3389
 ```
 
-## How It Works
+Two-stage pipeline:
 
-1. **Parse** CIDR ranges from input file (skipping comments, blanks, malformed entries)
-2. **Expand** ranges to individual IPs, deduplicating across overlapping ranges
-3. **Skip** ranges larger than `--max-cidr` prefix (to prevent memory/CPU overload)
-4. **Scan** each IP with a TCP connect to port 3389 using configurable timeout
-5. **Report** only IPs where the TCP connection succeeds (no false positives from ICMP or port probing)
-6. **Save** results to output file
+```bash
+# 1. recon: find RDP hosts with NLA not enforced
+./rdp-scan ranges.txt --format targets --only-nla-open -o live.txt
+# 2. audit: check those hosts for weak credentials
+raven-rdp audit -t live.txt -u users.txt -p pass.txt
+```
+
+### `jsonl`
+
+One JSON object per line (stream-safe, `jq`-friendly). `t` is UTC
+RFC3339; `err` appears only when the fingerprint failed:
+
+```json
+{"ip":"1.12.34.56","port":3389,"rdp":true,"nla":"required","rtt_ms":45,"t":"2026-09-11T13:04:22Z"}
+```
+
+### `csv`
+
+Header row plus one row per host:
+
+```
+ip,port,rdp,nla,rtt_ms,t
+1.12.34.56,3389,true,required,45,2026-09-11T13:04:22Z
+```
+
+Results stream as they are discovered (per-record flush), so a running
+scan's output file is always up to date — interrupt it (Ctrl+C) and the
+hosts found so far remain in the file.
+
+## Concurrency Guidelines
+
+| Target | Recommended `-c` | Notes |
+|--------|-----------------|-------|
+| /24 (256 hosts) | 50–100 | Default is fine |
+| /22 (1k hosts) | 100–200 | ~30s with 2s timeout |
+| /20 (4k hosts) | 100–300 | Network-dependent |
+| /16 (65k hosts) | 200–500 | Consider `-t 1s` for faster results |
+
+Higher concurrency is faster on fast networks but can saturate a link
+or trip rate limits. Lower it if you see many timeouts.
+
+## Performance Tips
+
+1. **Memory is flat**: the pipeline streams the address space; it never
+   materializes the full IP list. Peak RSS stays well under 50MB even
+   for a /16, and a /12 scans without OOM on a 512MB box.
+2. **`--max-cidr`** skips large ranges you do not need.
+   `--max-cidr 20` skips /19 and larger networks and still scans /20
+   and smaller.
+3. **`-t`** matches your network: unroutable space burns the full
+   timeout per probe, so use short timeouts for dead ranges.
+4. Overlapping CIDRs are merged before scanning, so duplicated input
+   costs nothing.
 
 ## Error Handling
 
-- Malformed CIDRs are logged and skipped
-- Overlapping CIDRs are deduplicated
-- Large CIDRs (configurable via `--max-cidr`) are skipped with a warning
-- Connection timeouts don't hang the scan
-- Refused connections are treated as closed (not errors)
+- Refused or timed-out connections are treated as closed (not an error)
+- Malformed CIDR lines are skipped with a warning on stderr
+- Read/write failures after connect keep the host `open` with a short
+  `fingerprint failed` reason in structured formats
+- Output write errors are reported on stderr and set exit code 1
+- Exit codes: `0` success, `1` runtime failure, `2` usage error,
+  `130` interrupted (Ctrl+C)
 
 ## Limitations
 
 - IPv4 only
 - TCP/3389 only (no other ports)
-- No authentication or credential testing
-- No service enumeration beyond connectivity
+- NLA is reported from the initial negotiation; full TLS behavior is
+  out of scope
+- The fingerprint assumes the service speaks RDP over plain TCP; load
+  balancers that terminate RDP may answer differently
 
 ## License
 
-GPL-3.0
+GPL-3.0 — see [LICENSE](LICENSE).
 
 ## Author
 
-For authorized penetration testing use only. Ensure you have explicit written permission before scanning any networks.
-# rdp-scan
+[salarrbl](https://github.com/salarrbl)

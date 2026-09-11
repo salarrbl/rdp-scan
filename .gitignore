@@ -1,0 +1,7 @@
+# build artifact
+rdp-scan
+
+# local test inputs/outputs
+test-local.txt
+test-local-out.txt
+test-output.txt

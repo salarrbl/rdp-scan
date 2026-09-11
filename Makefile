@@ -1,7 +1,7 @@
-.PHONY: build test clean install
+.PHONY: build test clean install test-local test-sample check fmt
 
 build:
-	go build -o rdp-scan .
+	go build -o rdp-scan ./cmd/rdp-scan
 
 test:
 	go test ./...
@@ -10,13 +10,12 @@ clean:
 	rm -f rdp-scan rdp_live.txt test-output.txt test-local-out.txt
 
 install:
-	go install .
+	go install ./cmd/rdp-scan
 
 # Test with local listener
 test-local:
-	@echo "Starting test..."
+	@test -f test-local.txt || (echo "missing test-local.txt"; exit 1)
 	./rdp-scan test-local.txt -o test-local-out.txt -c 5 -t 1s
-	@echo "Results:"
 	@cat test-local-out.txt 2>/dev/null || echo "(no results)"
 
 # Test with sample data
@@ -31,4 +30,4 @@ check:
 
 # Format code
 fmt:
-	go fmt .
+	go fmt ./...
