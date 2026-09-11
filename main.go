@@ -328,6 +328,34 @@ func newResultWriter(f outputFormat, out io.Writer) (resultWriter, error) {
 	return nil, fmt.Errorf("unknown output format: %s", f)
 }
 
+// isTerminal reports whether f is a TTY (character device).
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// renderProgress renders one progress line. On TTY it uses \r to
+// overwrite the current line; otherwise the caller appends a newline.
+func renderProgress(done, total int64, open int64, elapsed time.Duration) {
+	if total <= 0 {
+		return
+	}
+	pct := float64(done) / float64(total) * 100
+	var rate float64
+	var eta time.Duration
+	if elapsed > 0 && done > 0 {
+		rate = float64(done) / elapsed.Seconds()
+		if done < total {
+			eta = time.Duration(float64(total-done)/rate) * time.Second
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\r[*] %.1f%%  %d/%d  open=%d  %.0f/s  ETA %s",
+		pct, done, total, open, rate, eta.Round(time.Second))
+}
+
 // runPipeline is the streaming scan (B1 stages 2 and 3): a fixed pool of
 // `workers` goroutines reads addresses from a shared jobs channel, probes
 // each one, and hands results to a single reporter goroutine that updates
@@ -335,13 +363,15 @@ func newResultWriter(f outputFormat, out io.Writer) (resultWriter, error) {
 // memory is bounded by the range count plus the channel buffers.
 func runPipeline(ctx context.Context, ranges []Range, workers int, timeout time.Duration, emit func(Result)) error {
 	total := int64(totalIPs(ranges))
+	start := time.Now()
 
 	jobCh := make(chan uint32, workers*2)
 	resCh := make(chan Result, workers*2)
 
 	var processed, open atomic.Int64
 
-	// Stage 3: single reporter goroutine
+	// Stage 3: single reporter goroutine. It is the only writer of the
+	// counters, so each Add returns a consistent snapshot (C1).
 	var repWg sync.WaitGroup
 	repWg.Add(1)
 	go func() {
@@ -355,9 +385,10 @@ func runPipeline(ctx context.Context, ranges []Range, workers int, timeout time.
 		}
 	}()
 
-	// Progress reporter: the only goroutine that prints progress.
-	// Non-TTY: one line per 5000 completions (B5/Tty handling lands in
-	// the follow-up fix commit).
+	// Progress reporter: the only goroutine that prints progress (C2).
+	// TTY: overwrite the line every 250ms. Not on TTY: one line per
+	// 5000 completions.
+	tty := isTerminal(os.Stderr)
 	var progWg sync.WaitGroup
 	progWg.Add(1)
 	progDone := make(chan struct{})
@@ -372,9 +403,15 @@ func runPipeline(ctx context.Context, ranges []Range, workers int, timeout time.
 				return
 			case <-tick.C:
 				n := processed.Load()
-				if n-last >= 5000 || (n == total && n != 0) {
+				if tty {
+					if n != last {
+						last = n
+						renderProgress(n, total, open.Load(), time.Since(start))
+					}
+				} else if n-last >= 5000 {
 					last = n
-					fmt.Printf("[*] Progress: %d/%d (%.1f%%)\n", n, total, float64(n)/float64(total)*100)
+					renderProgress(n, total, open.Load(), time.Since(start))
+					fmt.Fprintln(os.Stderr)
 				}
 			}
 		}
@@ -413,6 +450,15 @@ func runPipeline(ctx context.Context, ranges []Range, workers int, timeout time.
 	repWg.Wait()
 	close(progDone)
 	progWg.Wait()
+
+	// Final progress render: 100%, then clear the line on TTY before
+	// the caller prints the summary.
+	renderProgress(total, total, open.Load(), time.Since(start))
+	if tty {
+		fmt.Fprint(os.Stderr, "\r\033[K\n")
+	} else {
+		fmt.Fprintln(os.Stderr)
+	}
 	return nil
 }
 
@@ -426,49 +472,64 @@ func main() {
 	formatStr := "txt"
 	onlyNLAOpen := false
 
+	// fail reports a usage error: message, help, exit 2 (C5)
+	fail := func(format string, a ...interface{}) {
+		fmt.Fprintf(os.Stderr, format+"\n", a...)
+		printUsage()
+		os.Exit(2)
+	}
+
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
+		arg := args[i]
+		// need reads the value following arg, or fails if it is missing
+		need := func() string {
+			if i+1 >= len(args) {
+				fail("missing value for flag: %s", arg)
+			}
+			i++
+			return args[i]
+		}
+		switch arg {
 		case "-o", "--output":
-			if i+1 < len(args) {
-				outputFile = args[i+1]
-				i++
-			}
+			outputFile = need()
 		case "-c", "--concurrency":
-			if i+1 < len(args) {
-				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
-					concurrency = n
-				}
-				i++
+			v := need()
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				fail("invalid concurrency: %s (must be a positive integer)", v)
 			}
+			concurrency = n
 		case "-t", "--timeout":
-			if i+1 < len(args) {
-				if d, err := time.ParseDuration(args[i+1]); err == nil {
-					timeout = d
-				}
-				i++
+			v := need()
+			d, err := time.ParseDuration(v)
+			if err != nil || d <= 0 {
+				fail("invalid timeout: %s (e.g., 500ms, 2s)", v)
 			}
+			timeout = d
 		case "--max-cidr":
-			if i+1 < len(args) {
-				if n, err := strconv.Atoi(args[i+1]); err == nil && n >= 0 && n <= 32 {
-					maxCIDR = n
-				}
-				i++
+			v := need()
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 || n > 32 {
+				fail("invalid --max-cidr: %s (must be 0-32)", v)
 			}
+			maxCIDR = n
 		case "--format":
-			if i+1 < len(args) {
-				formatStr = args[i+1]
-				i++
-			}
+			formatStr = need()
 		case "--only-nla-open":
 			onlyNLAOpen = true
 		case "-h", "--help":
 			printUsage()
 			return
 		default:
-			if !strings.HasPrefix(args[i], "-") && inputFile == "" {
-				inputFile = args[i]
+			if strings.HasPrefix(arg, "-") {
+				fail("unknown flag: %s", arg)
 			}
+			if inputFile == "" {
+				inputFile = arg
+				continue
+			}
+			fail("unexpected positional argument: %s", arg)
 		}
 	}
 
@@ -479,8 +540,7 @@ func main() {
 
 	f, ok := parseFormat(formatStr)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "unknown format: %s (valid: txt, jsonl, csv, targets)\n", formatStr)
-		os.Exit(2)
+		fail("unknown format: %s (valid: txt, jsonl, csv, targets)", formatStr)
 	}
 
 	// Handle SIGINT/SIGTERM: first signal stops new probes (results
@@ -501,19 +561,20 @@ func main() {
 		}
 	}()
 
-	// Read and parse CIDRs
-	fmt.Println("[*] Loading CIDRs...")
+	// Read and parse CIDRs (all status output goes to stderr; results
+	// are the only stdout writes)
+	fmt.Fprintln(os.Stderr, "[*] Loading CIDRs...")
 	cidrs, err := readCIDRs(inputFile, maxCIDR)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error reading input: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("[*] Parsed %d CIDR ranges (after filtering)\n", len(cidrs))
+	fmt.Fprintf(os.Stderr, "[*] Parsed %d CIDR ranges (after filtering)\n", len(cidrs))
 
 	// Normalize to disjoint ranges (dedup by construction)
 	ranges := normalize(cidrs)
 	total := totalIPs(ranges)
-	fmt.Printf("[*] %d CIDR ranges -> %d unique addresses (raw addresses before merge: %d)\n",
+	fmt.Fprintf(os.Stderr, "[*] %d CIDR ranges -> %d unique addresses (raw addresses before merge: %d)\n",
 		len(cidrs), total, rawAddressCount(cidrs))
 
 	// Output destination: file when -o is set, stdout otherwise. The
@@ -533,9 +594,9 @@ func main() {
 
 	if total == 0 {
 		if outputFile != "" {
-			fmt.Printf("[!] No live hosts; empty report written to: %s\n", outputFile)
+			fmt.Fprintf(os.Stderr, "[!] No live hosts; empty report written to: %s\n", outputFile)
 		} else {
-			fmt.Println("[!] No valid IPs to scan")
+			fmt.Fprintln(os.Stderr, "[!] No valid IPs to scan")
 		}
 		os.Exit(0)
 	}
@@ -546,7 +607,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("[*] Scanning TCP/3389 (concurrency: %d, timeout: %s, format: %s)...\n",
+	fmt.Fprintf(os.Stderr, "[*] Scanning TCP/3389 (concurrency: %d, timeout: %s, format: %s)...\n",
 		concurrency, timeout, f)
 
 	// The reporter goroutine calls emit sequentially, so no locking is
@@ -582,13 +643,17 @@ func main() {
 		os.Exit(130)
 	}
 
-	fmt.Printf("[+] Scan complete\n")
-	fmt.Printf("[+] %d live host(s) found; %d written to output\n", openCount.Load(), written.Load())
+	if writeFailed.Load() {
+		os.Exit(1)
+	}
+
+	fmt.Fprintln(os.Stderr, "[+] Scan complete")
+	fmt.Fprintf(os.Stderr, "[+] %d live host(s) found; %d written to output\n", openCount.Load(), written.Load())
 	if outputFile != "" {
 		if written.Load() == 0 {
-			fmt.Printf("[!] No live hosts; empty report written to: %s\n", outputFile)
+			fmt.Fprintf(os.Stderr, "[!] No live hosts; empty report written to: %s\n", outputFile)
 		} else {
-			fmt.Printf("[+] Results saved to: %s\n", outputFile)
+			fmt.Fprintf(os.Stderr, "[+] Results saved to: %s\n", outputFile)
 		}
 	}
 }
@@ -639,8 +704,9 @@ func readCIDRs(filename string, maxCIDR int) ([]CIDR, error) {
 
 	var cidrs []CIDR
 	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	// CIDR lines are short; 64KB max is plenty (D1)
+	buf := make([]byte, 0, 4*1024)
+	scanner.Buffer(buf, 64*1024)
 	
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
