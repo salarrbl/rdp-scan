@@ -1,0 +1,5 @@
+# Input for `make test-local`: loopback only, nothing routable.
+# Start something on 127.0.0.1:3389 first if you want an OPEN result - the
+# scanner requires an X.224 Connection Confirm, so a plain `nc -l 3389` will be
+# reported as "open, no RDP handshake".
+127.0.0.0/31

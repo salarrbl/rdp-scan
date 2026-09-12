@@ -1,0 +1,7 @@
+# Build output
+/rdp-scan
+
+# Scan output / test artifacts (see `make clean`)
+/rdp_live.txt
+/test-output.txt
+/test-local-out.txt

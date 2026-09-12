@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -14,16 +16,54 @@ import (
 	"time"
 )
 
+// rdpPort is the TCP port this scanner probes.
+const rdpPort = "3389"
+
+// TPKT (RFC 1006) / X.224 (ISO 8073) framing used by RDP (MS-RDPBCGR 2.2).
+const (
+	tpktVersion   = 3
+	tpktHeaderLen = 4
+
+	// x224CodeCC is the Connection Confirm TPDU code. The low nibble of an
+	// X.224 TPDU code carries the "credit" field, so comparisons mask it off.
+	x224CodeCC = 0xD0
+
+	// minTPKTLen is the smallest plausible TPKT packet: 4 byte header plus the
+	// X.224 length indicator and TPDU code. maxTPKTLen caps how much of a
+	// response we buffer - a real Connection Confirm is ~19 bytes.
+	minTPKTLen = tpktHeaderLen + 2
+	maxTPKTLen = 4096
+
+	// minX224LI is the shortest X.224 CC header after the length indicator:
+	// code(1) + DST-REF(2) + SRC-REF(2) + class(1).
+	minX224LI = 6
+)
+
+// expandProgressEvery is how many IPs may be expanded between progress lines.
+const expandProgressEvery int64 = 50000
+
+// errIPv6Unsupported marks input that is a perfectly valid IPv6 CIDR but out of
+// scope for this IPv4-only scanner. Keeping it distinct from a parse failure is
+// what lets readCIDRs report "IPv6 not supported" instead of "malformed".
+var errIPv6Unsupported = errors.New("IPv6 is not supported (this scanner is IPv4-only)")
+
 // CIDR represents a parsed CIDR range
 type CIDR struct {
 	IP   net.IP
 	Mask int
 }
 
-// ScanResult holds the result of a scan
+// ScanResult holds the result of a scan.
+//
+// Open means "3389/tcp spoke RDP": the host answered our X.224 Connection
+// Request with an X.224 Connection Confirm. TCPOpen records that the TCP
+// connection itself succeeded, which is what separates "port closed/filtered"
+// from "port open, but something other than RDP is behind it".
 type ScanResult struct {
-	IP   string
-	Open bool
+	IP      string
+	Open    bool
+	TCPOpen bool
+	Detail  string
 }
 
 func main() {
@@ -108,22 +148,29 @@ func main() {
 	fmt.Printf("[*] Scanning TCP/3389 (concurrency: %d, timeout: %s)...\n", concurrency, timeout)
 	results := scanIPs(ips, concurrency, timeout)
 
-	// Filter open and print
-	var openIPs []string
-	openCount := 0
+	// Filter and report
+	var openIPs, nonRDPIP []string
 	for _, r := range results {
-		if r.Open {
+		switch {
+		case r.Open:
 			openIPs = append(openIPs, r.IP)
-			openCount++
-			fmt.Printf("[+] %s:3389 OPEN\n", r.IP)
+			fmt.Printf("[+] %s:%s OPEN\n", r.IP, rdpPort)
+		case r.TCPOpen:
+			// Something is listening, but it did not complete an RDP
+			// handshake. Reported, not counted as an RDP host.
+			nonRDPIP = append(nonRDPIP, r.IP)
+			fmt.Printf("[!] %s:%s open, no RDP handshake (%s)\n", r.IP, rdpPort, r.Detail)
 		}
 	}
 
 	fmt.Printf("[+] Scan complete\n")
-	fmt.Printf("[+] %d RDP host(s) found\n", openCount)
+	fmt.Printf("[+] %d RDP host(s) found\n", len(openIPs))
+	if len(nonRDPIP) > 0 {
+		fmt.Printf("[!] %d host(s) with %s/tcp open that did not speak RDP\n", len(nonRDPIP), rdpPort)
+	}
 
 	// Save results
-	if openCount > 0 {
+	if len(openIPs) > 0 {
 		if err := saveResults(openIPs, outputFile); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving results: %v\n", err)
 		} else {
@@ -145,7 +192,8 @@ Arguments:
 Options:
   -o, --output      Output file for found hosts (default: rdp_live.txt)
   -c, --concurrency Number of concurrent TCP checks (default: 100)
-  -t, --timeout     TCP connection timeout (default: 5s, e.g., 500ms, 5s)
+  -t, --timeout     Per-host timeout for the TCP connect and the RDP
+                    handshake that follows it (default: 5s, e.g., 500ms, 5s)
   --max-cidr        Skip CIDRs smaller than this prefix (e.g., 20 skips /20 and larger networks)
   -h, --help        Show this help message
 
@@ -157,6 +205,13 @@ Input file format:
   Lines starting with # are comments.
   Blank lines are ignored.
   Malformed entries are skipped with a warning.
+  IPv6 entries are skipped as unsupported (this scanner is IPv4-only).
+
+Detection:
+  A host counts as OPEN only when it answers an RDP X.224 Connection
+  Request with a valid X.224 Connection Confirm. Hosts that accept the
+  TCP connection but do not speak RDP are reported separately as
+  "open, no RDP handshake" and are not written to the output file.
 
 Examples:
   rdp-scan ranges.txt
@@ -184,77 +239,90 @@ func readCIDRs(filename string, maxCIDR int) ([]CIDR, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if cidr, ok := parseCIDR(line); ok {
-			// Skip large CIDRs if maxCIDR is set
-			if maxCIDR > 0 && cidr.Mask < maxCIDR {
-				totalIPs := uint64(1) << uint(32-cidr.Mask)
-				fmt.Fprintf(os.Stderr, "[!] Skipping %s/%d (%d IPs) - use --max-cidr to change threshold\n",
-					cidr.IP.String(), cidr.Mask, totalIPs)
-				continue
+
+		cidr, err := parseCIDR(line)
+		if err != nil {
+			// A valid IPv6 range is unsupported input, not broken input:
+			// say which one it actually is.
+			if errors.Is(err, errIPv6Unsupported) {
+				fmt.Fprintf(os.Stderr, "[!] Skipping %s - %v\n", line, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[!] Skipping malformed CIDR %q - %v\n", line, err)
 			}
-			cidrs = append(cidrs, cidr)
-		} else {
-			fmt.Fprintf(os.Stderr, "[!] Skipping malformed CIDR: %s\n", line)
+			continue
 		}
+
+		// Skip large CIDRs if maxCIDR is set
+		if maxCIDR > 0 && cidr.Mask < maxCIDR {
+			totalIPs := uint64(1) << uint(32-cidr.Mask)
+			fmt.Fprintf(os.Stderr, "[!] Skipping %s/%d (%d IPs) - use --max-cidr to change threshold\n",
+				cidr.IP.String(), cidr.Mask, totalIPs)
+			continue
+		}
+		cidrs = append(cidrs, cidr)
 	}
 	return cidrs, scanner.Err()
 }
 
-func parseCIDR(s string) (CIDR, bool) {
+// parseCIDR parses "a.b.c.d/n" into a CIDR. It returns errIPv6Unsupported for
+// valid IPv6 input and a descriptive error for anything genuinely malformed.
+// The network address is normalised so host bits in the input (10.0.0.5/24)
+// cannot shift the expansion outside the intended range.
+func parseCIDR(s string) (CIDR, error) {
 	s = strings.TrimSpace(s)
 	parts := strings.SplitN(s, "/", 2)
 	if len(parts) != 2 {
-		return CIDR{}, false
+		return CIDR{}, fmt.Errorf("expected <ip>/<prefix>, e.g. 10.0.0.0/24")
 	}
 	ip := net.ParseIP(parts[0])
 	if ip == nil {
-		return CIDR{}, false
+		return CIDR{}, fmt.Errorf("%q is not a valid IP address", parts[0])
+	}
+	// Checked before the prefix so that IPv6 (whose prefixes usually exceed 32)
+	// is reported as unsupported rather than as an out-of-range prefix.
+	if ip.To4() == nil || strings.ContainsRune(parts[0], ':') {
+		return CIDR{}, errIPv6Unsupported
 	}
 	mask, err := strconv.Atoi(parts[1])
-	if err != nil || mask < 0 || mask > 32 {
-		return CIDR{}, false
+	if err != nil {
+		return CIDR{}, fmt.Errorf("prefix %q is not a number", parts[1])
 	}
-	// Only support IPv4
-	if ip.To4() == nil {
-		return CIDR{}, false
+	if mask < 0 || mask > 32 {
+		return CIDR{}, fmt.Errorf("prefix /%d out of range for IPv4 (0-32)", mask)
 	}
-	return CIDR{IP: ip.To4(), Mask: mask}, true
+	return CIDR{IP: ip.To4().Mask(net.CIDRMask(mask, 32)), Mask: mask}, nil
 }
 
-// expandCIDRs expands CIDR ranges to unique IP addresses
+// expandCIDRs expands CIDR ranges to unique IP addresses.
+//
+// Expansion is single-threaded, so the set and the counters are plain values.
+// The previous mutex/atomic dance protected nothing and, worse, the progress
+// line read a counter nobody ever incremented, so it always printed 0.
 func expandCIDRs(cidrs []CIDR) ([]string, error) {
 	// Use a map for deduplication
 	ipSet := make(map[string]struct{})
-	var mu sync.Mutex
-	totalIPs := 0
-	var ipCount int64
-	var totalCounter int64
+	var totalIPs int64
+	var lastReported int64
 
 	for _, cidr := range cidrs {
-		start := ipToBigInt(cidr.IP)
 		hostBits := 32 - cidr.Mask
 		count := uint64(1) << uint(hostBits)
 
-		current := new(big.Int).Set(start)
+		current := ipToBigInt(cidr.IP)
 		one := big.NewInt(1)
 
 		for i := uint64(0); i < count; i++ {
-			ipStr := bigIntToIP(current)
-			
-			// Add to set atomically
-			mu.Lock()
-			ipSet[ipStr] = struct{}{}
-			mu.Unlock()
-			
+			ipSet[bigIntToIP(current)] = struct{}{}
 			current.Add(current, one)
 		}
-		totalIPs += int(count)
+		totalIPs += int64(count)
 
-		// Update counter atomically periodically
-		atomic.AddInt64(&totalCounter, int64(count))
-		if atomic.LoadInt64(&totalCounter)%50000 == 0 {
-			ipsRead := atomic.LoadInt64(&ipCount)
-			fmt.Fprintf(os.Stderr, "[*] Expanding... %d unique IPs so far\n", ipsRead)
+		// Report at most once per expandProgressEvery IPs. Comparing against the
+		// last report (instead of testing an exact multiple) keeps the line from
+		// being skipped when one CIDR is larger than the reporting interval.
+		if totalIPs-lastReported >= expandProgressEvery {
+			lastReported = totalIPs
+			fmt.Fprintf(os.Stderr, "[*] Expanding... %d IPs (%d unique so far)\n", totalIPs, len(ipSet))
 		}
 	}
 
@@ -287,9 +355,139 @@ func bigIntToIP(n *big.Int) string {
 	return fmt.Sprintf("%d.%d.%d.%d", bytes[0], bytes[1], bytes[2], bytes[3])
 }
 
+// x224ConnectionRequest returns an RDP X.224 Connection Request PDU
+// (MS-RDPBCGR 2.2.1.1) carrying an RDP Negotiation Request for TLS|CredSSP.
+//
+// This is what a real RDP client sends first, and a real RDP listener answers
+// it with an X.224 Connection Confirm - which is a far stronger signal than
+// "something accepted the TCP connection" or "something sent bytes".
+func x224ConnectionRequest() []byte {
+	return []byte{
+		// TPKT header: version 3, reserved 0, total length 19
+		0x03, 0x00, 0x00, 0x13,
+		// X.224 CR TPDU: LI=14, code=0xE0, DST-REF=0, SRC-REF=0, class=0
+		0x0E, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00,
+		// RDP Negotiation Request: type=0x01, flags=0x00, length=8,
+		// requestedProtocols=0x00000003 (PROTOCOL_SSL|PROTOCOL_HYBRID)
+		0x01, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00,
+	}
+}
+
+// isX224ConnectionConfirm validates a complete TPKT packet (header included)
+// and reports whether it is an X.224 Connection Confirm, optionally carrying
+// an RDP Negotiation Response (0x02) or Negotiation Failure (0x03) - both of
+// which still mean "RDP is on the other end".
+func isX224ConnectionConfirm(pkt []byte) (bool, string) {
+	if len(pkt) < minTPKTLen {
+		return false, fmt.Sprintf("response too short (%d bytes)", len(pkt))
+	}
+	if pkt[0] != tpktVersion {
+		return false, fmt.Sprintf("not TPKT (version 0x%02X)", pkt[0])
+	}
+	pktLen := int(pkt[2])<<8 | int(pkt[3])
+	if pktLen < minTPKTLen || pktLen > maxTPKTLen {
+		return false, fmt.Sprintf("implausible TPKT length %d", pktLen)
+	}
+	if pktLen > len(pkt) {
+		return false, fmt.Sprintf("truncated TPKT (declared %d, got %d)", pktLen, len(pkt))
+	}
+	// Check the TPDU code before the length indicator: "X.224 Data, not a
+	// Connection Confirm" is a more useful answer than "bad length" when the
+	// peer is speaking X.224 but not the RDP handshake.
+	code := pkt[tpktHeaderLen+1]
+	if code&0xF0 != x224CodeCC {
+		return false, fmt.Sprintf("X.224 TPDU 0x%02X, not Connection Confirm (0xD0)", code)
+	}
+	li := int(pkt[tpktHeaderLen])
+	if li < minX224LI || li > pktLen-tpktHeaderLen-1 {
+		return false, fmt.Sprintf("bad X.224 length indicator %d", li)
+	}
+	return true, "X.224 Connection Confirm"
+}
+
+// describeErr turns a probe error into a short reason.
+//
+// Deadline misses arrive wrapped in a *net.OpError, so errors.As plus
+// net.Error.Timeout() is the only reliable test - comparing the error against
+// os.ErrDeadlineExceeded with == never matches.
+func describeErr(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, io.EOF):
+		return "closed without a response"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "truncated response"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout waiting for RDP handshake"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Err != nil {
+		// e.g. "connection refused", "no route to host", "connection reset by peer"
+		return opErr.Err.Error()
+	}
+	return err.Error()
+}
+
+// probeRDP decides whether the service at addr speaks RDP: connect, send an
+// X.224 Connection Request, require a valid X.224 Connection Confirm back.
+// The same timeout bounds both the connect and the handshake, so a host that
+// accepts connections but never answers cannot stall the scan.
+func probeRDP(ip, addr string, timeout time.Duration) ScanResult {
+	result := ScanResult{IP: ip}
+
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		result.Detail = describeErr(err)
+		return result
+	}
+	defer conn.Close()
+	result.TCPOpen = true
+
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		result.Detail = describeErr(err)
+		return result
+	}
+
+	if _, err := conn.Write(x224ConnectionRequest()); err != nil {
+		result.Detail = "handshake: " + describeErr(err)
+		return result
+	}
+
+	var hdr [tpktHeaderLen]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		result.Detail = "handshake: " + describeErr(err)
+		return result
+	}
+	if hdr[0] != tpktVersion {
+		// Anything that answers with its own banner (SSH, HTTP, SMTP, ...)
+		// fails here: the port is open, but it is not RDP.
+		result.Detail = fmt.Sprintf("not a TPKT response (first byte 0x%02X)", hdr[0])
+		return result
+	}
+	pktLen := int(hdr[2])<<8 | int(hdr[3])
+	if pktLen < minTPKTLen || pktLen > maxTPKTLen {
+		result.Detail = fmt.Sprintf("implausible TPKT length %d", pktLen)
+		return result
+	}
+	pkt := make([]byte, pktLen)
+	copy(pkt, hdr[:])
+	if _, err := io.ReadFull(conn, pkt[tpktHeaderLen:]); err != nil {
+		result.Detail = "handshake: " + describeErr(err)
+		return result
+	}
+
+	result.Open, result.Detail = isX224ConnectionConfirm(pkt)
+	return result
+}
+
+// scanIPs probes every IP on TCP/3389 with at most concurrency probes in
+// flight. Each goroutine writes only its own results[idx] slot and wg.Wait()
+// happens-before the caller reads the slice, so no mutex is needed here.
 func scanIPs(ips []string, concurrency int, timeout time.Duration) []ScanResult {
 	var wg sync.WaitGroup
-	var mu sync.Mutex
 	results := make([]ScanResult, len(ips))
 	var processed atomic.Int64
 	total := int64(len(ips))
@@ -304,42 +502,11 @@ func scanIPs(ips []string, concurrency int, timeout time.Duration) []ScanResult 
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			result := ScanResult{IP: ipAddr}
-			addr := net.JoinHostPort(ipAddr, "3389")
+			results[idx] = probeRDP(ipAddr, net.JoinHostPort(ipAddr, rdpPort), timeout)
 
-			// Set deadline to prevent hanging and detect RDP handshake
-			conn, err := net.DialTimeout("tcp", addr, timeout)
-			if err == nil {
-				// Set read deadline to detect handshake completion
-				defer conn.Close()
-				
-				// Attempt to complete a brief handshake
-				conn.SetReadDeadline(time.Now().Add(time.Second))
-				
-				// Try to read some data (first few bytes of RDP handshake)
-				buf := make([]byte, 512)
-				n, err := conn.Read(buf)
-				if err == nil && n > 0 {
-					// Successfully read data - this is likely a real RDP
-					result.Open = true
-				} else if err == os.ErrDeadlineExceeded {
-					// Handshake incomplete - not RDP
-					result.Open = false
-				} else if n == 0 {
-					// Connection closed immediately - likely RDP
-					result.Open = true
-				}
-			}
-
-			mu.Lock()
-			results[idx] = result
-			mu.Unlock()
-
-			processed.Add(1)
 			// Print progress every 500 or at completion
-			if processed.Load()%500 == 0 || processed.Load() == total {
-				fmt.Printf("[*] Progress: %d/%d (%.1f%%)\n",
-					processed.Load(), total, float64(processed.Load())/float64(total)*100)
+			if done := processed.Add(1); done%500 == 0 || done == total {
+				fmt.Printf("[*] Progress: %d/%d (%.1f%%)\n", done, total, float64(done)/float64(total)*100)
 			}
 		}(i, ip)
 	}
