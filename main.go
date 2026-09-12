@@ -22,8 +22,8 @@ type CIDR struct {
 
 // ScanResult holds the result of a scan
 type ScanResult struct {
-	IP     string
-	Open   bool
+	IP   string
+	Open bool
 }
 
 func main() {
@@ -31,7 +31,7 @@ func main() {
 	inputFile := ""
 	outputFile := "rdp_live.txt"
 	concurrency := 100
-	timeout := 2 * time.Second
+	timeout := 5 * time.Second
 	maxCIDR := 0 // 0 = no limit, skip CIDRs smaller than this (e.g., 20 skips /20 and larger networks)
 
 	args := os.Args[1:]
@@ -89,7 +89,11 @@ func main() {
 
 	// Expand to unique IPs with progress
 	fmt.Println("[*] Expanding ranges...")
-	ips := expandCIDRs(cidrs)
+	ips, err := expandCIDRs(cidrs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error expanding CIDRs: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("[+] %d unique IPs\n", len(ips))
 
 	if len(ips) == 0 {
@@ -141,7 +145,7 @@ Arguments:
 Options:
   -o, --output      Output file for found hosts (default: rdp_live.txt)
   -c, --concurrency Number of concurrent TCP checks (default: 100)
-  -t, --timeout     TCP connection timeout (default: 2s, e.g., 500ms, 2s)
+  -t, --timeout     TCP connection timeout (default: 5s, e.g., 500ms, 5s)
   --max-cidr        Skip CIDRs smaller than this prefix (e.g., 20 skips /20 and larger networks)
   -h, --help        Show this help message
 
@@ -149,7 +153,7 @@ Input file format:
   One CIDR per line, e.g.:
     1.0.1.0/24
     1.0.2.0/23
-    
+  
   Lines starting with # are comments.
   Blank lines are ignored.
   Malformed entries are skipped with a warning.
@@ -173,7 +177,7 @@ func readCIDRs(filename string, maxCIDR int) ([]CIDR, error) {
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
-	
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		// Skip comments and blank lines
@@ -184,7 +188,7 @@ func readCIDRs(filename string, maxCIDR int) ([]CIDR, error) {
 			// Skip large CIDRs if maxCIDR is set
 			if maxCIDR > 0 && cidr.Mask < maxCIDR {
 				totalIPs := uint64(1) << uint(32-cidr.Mask)
-				fmt.Fprintf(os.Stderr, "[!] Skipping %s/%d (%d IPs) - use --max-cidr to change threshold\n", 
+				fmt.Fprintf(os.Stderr, "[!] Skipping %s/%d (%d IPs) - use --max-cidr to change threshold\n",
 					cidr.IP.String(), cidr.Mask, totalIPs)
 				continue
 			}
@@ -218,39 +222,50 @@ func parseCIDR(s string) (CIDR, bool) {
 }
 
 // expandCIDRs expands CIDR ranges to unique IP addresses
-func expandCIDRs(cidrs []CIDR) []string {
+func expandCIDRs(cidrs []CIDR) ([]string, error) {
 	// Use a map for deduplication
 	ipSet := make(map[string]struct{})
-	
+	var mu sync.Mutex
 	totalIPs := 0
+	var ipCount int64
+	var totalCounter int64
+
 	for _, cidr := range cidrs {
 		start := ipToBigInt(cidr.IP)
 		hostBits := 32 - cidr.Mask
 		count := uint64(1) << uint(hostBits)
-		
+
 		current := new(big.Int).Set(start)
 		one := big.NewInt(1)
-		
+
 		for i := uint64(0); i < count; i++ {
 			ipStr := bigIntToIP(current)
+			
+			// Add to set atomically
+			mu.Lock()
 			ipSet[ipStr] = struct{}{}
+			mu.Unlock()
+			
 			current.Add(current, one)
 		}
 		totalIPs += int(count)
-		
-		if len(ipSet)%100000 == 0 {
-			fmt.Fprintf(os.Stderr, "[*] Expanding... %d unique IPs so far\n", len(ipSet))
+
+		// Update counter atomically periodically
+		atomic.AddInt64(&totalCounter, int64(count))
+		if atomic.LoadInt64(&totalCounter)%50000 == 0 {
+			ipsRead := atomic.LoadInt64(&ipCount)
+			fmt.Fprintf(os.Stderr, "[*] Expanding... %d unique IPs so far\n", ipsRead)
 		}
 	}
-	
+
 	// Convert map to sorted slice
 	ips := make([]string, 0, len(ipSet))
 	for ip := range ipSet {
 		ips = append(ips, ip)
 	}
-	
+
 	fmt.Fprintf(os.Stderr, "[*] Expanded %d total IPs from %d CIDRs\n", totalIPs, len(cidrs))
-	return ips
+	return ips, nil
 }
 
 func ipToBigInt(ip net.IP) *big.Int {
@@ -291,10 +306,29 @@ func scanIPs(ips []string, concurrency int, timeout time.Duration) []ScanResult 
 
 			result := ScanResult{IP: ipAddr}
 			addr := net.JoinHostPort(ipAddr, "3389")
+
+			// Set deadline to prevent hanging and detect RDP handshake
 			conn, err := net.DialTimeout("tcp", addr, timeout)
 			if err == nil {
-				conn.Close()
-				result.Open = true
+				// Set read deadline to detect handshake completion
+				defer conn.Close()
+				
+				// Attempt to complete a brief handshake
+				conn.SetReadDeadline(time.Now().Add(time.Second))
+				
+				// Try to read some data (first few bytes of RDP handshake)
+				buf := make([]byte, 512)
+				n, err := conn.Read(buf)
+				if err == nil && n > 0 {
+					// Successfully read data - this is likely a real RDP
+					result.Open = true
+				} else if err == os.ErrDeadlineExceeded {
+					// Handshake incomplete - not RDP
+					result.Open = false
+				} else if n == 0 {
+					// Connection closed immediately - likely RDP
+					result.Open = true
+				}
 			}
 
 			mu.Lock()
@@ -304,7 +338,7 @@ func scanIPs(ips []string, concurrency int, timeout time.Duration) []ScanResult 
 			processed.Add(1)
 			// Print progress every 500 or at completion
 			if processed.Load()%500 == 0 || processed.Load() == total {
-				fmt.Printf("[*] Progress: %d/%d (%.1f%%)\n", 
+				fmt.Printf("[*] Progress: %d/%d (%.1f%%)\n",
 					processed.Load(), total, float64(processed.Load())/float64(total)*100)
 			}
 		}(i, ip)
