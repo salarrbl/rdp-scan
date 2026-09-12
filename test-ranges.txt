@@ -1,0 +1,28 @@
+# Sample input for `make test-sample`.
+#
+# Only loopback (RFC 1122) and documentation space (RFC 5737) appear below, so
+# this scan never touches a third-party host and is safe to run anywhere.
+# Expect nothing to answer on 3389/tcp unless you have a local listener up -
+# `go test ./...` covers the handshake logic against in-process fakes.
+#
+# Note: comments must be on their own line; the parser only skips lines that
+# *start* with '#'.
+
+# Loopback.
+127.0.0.0/29
+127.0.1.0/30
+
+# Already inside 127.0.0.0/29 - expansion must deduplicate it, so the unique
+# count stays at 16 while the total is 18.
+127.0.0.4/31
+
+# Non-routable documentation prefix: exercises the connect-timeout path.
+192.0.2.0/30
+
+# Skipped as unsupported (valid IPv6, not malformed).
+2001:db8::/32
+::1/128
+
+# Skipped as malformed.
+10.0.0.0/33
+not-a-cidr

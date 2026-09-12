@@ -1,4 +1,4 @@
-.PHONY: build test clean install
+.PHONY: build test clean install test-local test-sample check fmt
 
 build:
 	go build -o rdp-scan .
@@ -13,14 +13,19 @@ install:
 	go install .
 
 # Test with local listener
-test-local:
+test-local: build
 	@echo "Starting test..."
+	@rm -f test-local-out.txt
 	./rdp-scan test-local.txt -o test-local-out.txt -c 5 -t 1s
 	@echo "Results:"
 	@cat test-local-out.txt 2>/dev/null || echo "(no results)"
 
-# Test with sample data
-test-sample:
+# Test with sample data.
+# The stale-output rm matters: rdp-scan only writes the output file when it
+# finds hosts, so a previous run's results would otherwise be shown as if they
+# were this run's.
+test-sample: build
+	@rm -f test-output.txt
 	./rdp-scan test-ranges.txt -o test-output.txt -c 10 -t 1s
 	@echo "Results:"
 	@cat test-output.txt 2>/dev/null || echo "(no results)"
