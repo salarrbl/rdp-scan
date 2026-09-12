@@ -24,35 +24,30 @@ type CIDR struct {
 type ScanResult struct {
 	IP      string
 	Open    bool
-	Status  string // OPEN, CLOSED, TIMEOUT
+	Status  string
 	Duration time.Duration
 }
 
-// Job represents a scan job for a worker
 type Job struct {
-	IP     string
-	Result chan ScanResult
+	IP string
 }
 
-// Config holds configuration
 type Config struct {
-	InputFile    string
-	OutputFile   string
-	Workers      int
-	MaxCIDR      int
+	InputFile  string
+	OutputFile string
+	Workers    int
+	MaxCIDR    int
 	ShowProgress bool
 }
 
 func main() {
-	// Load config from flags
 	config := loadConfig()
-
+	
 	if config.InputFile == "" {
 		printUsage()
 		os.Exit(1)
 	}
 
-	// Read and parse CIDRs
 	fmt.Println("[*] Loading CIDRs...")
 	cidrs, err := readCIDRs(config.InputFile, config.MaxCIDR)
 	if err != nil {
@@ -61,7 +56,6 @@ func main() {
 	}
 	fmt.Printf("[*] Parsed %d CIDR ranges (after filtering)\n", len(cidrs))
 
-	// Expand to unique IPs with progress
 	fmt.Println("[*] Expanding ranges...")
 	ips, err := expandCIDRs(cidrs)
 	if err != nil {
@@ -75,15 +69,11 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Sort IPs for consistent output
 	sort.Strings(ips)
-
-	// Scan with worker pool
 	fmt.Printf("[*] Scanning TCP/3389 (workers: %d)...\n", config.Workers)
 	
 	results := scanIPs(ips, config)
 
-	// Filter open and print
 	var openIPs []ScanResult
 	openCount := 0
 	for _, r := range results {
@@ -96,7 +86,6 @@ func main() {
 	fmt.Printf("[+] Scan complete\n")
 	fmt.Printf("[+] %d RDP host(s) found\n", openCount)
 
-	// Save results
 	if openCount > 0 {
 		if err := saveResults(openIPs, config.OutputFile); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving results: %v\n", err)
@@ -303,37 +292,20 @@ func bigIntToIP(n *big.Int) string {
 
 func scanIPs(ips []string, config *Config) []ScanResult {
 	var wg sync.WaitGroup
-	results := make([]ScanResult, len(ips))
 	var processed atomic.Int64
 	total := int64(len(ips))
 
-	// Worker pool - buffered channels
+	// Queue and result channels
 	jobChan := make(chan Job, 1000)
-	resultsChan := make(chan ResultItem, 2000)
-	var resultsMu sync.Mutex
-	finishedCount := int64(0)
-	totalWorkers := int32(config.Workers)
+	resultsChan := make(chan ScanResult, 2000)
+	
+	// Worker completion counter
+	workersTerminated := atomic.Int32{}
 
-	// Start workers
-	var workersWg sync.WaitGroup
-	for id := 0; id < config.Workers; id++ {
-		workersWg.Add(1)
-		go worker(id, jobChan, resultsChan, &resultsMu, &finishedCount, &totalWorkers)
-	}
-
-	// Start result aggregator
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
-
-	// Queue jobs
+	// Start producer (job queue)
 	go func() {
 		for _, ip := range ips {
-			jobChan <- Job{
-				IP:     ip,
-				Result: make(chan ScanResult),
-			}
+			jobChan <- Job{IP: ip}
 			processed.Add(1)
 			if int(processed.Load())%1000 == 0 {
 				fmt.Printf("[*] Progress: %d/%d (%.1f%%)\r", 
@@ -344,74 +316,71 @@ func scanIPs(ips []string, config *Config) []ScanResult {
 		close(jobChan)
 	}()
 
-	// Collect results
-	for result := range resultsChan {
-		results[result.Index] = result.ScanResult
-	}
-
-	workersWg.Wait()
-	fmt.Println()
-
-	return results
-}
-
-type ResultItem struct {
-	ScanResult  ScanResult
-	Index       int
-}
-
-func worker(id int, jobs <-chan Job, results chan<- ResultItem, resultsMu *sync.Mutex, finishedCount *int64, totalWorkers *int32) {
-	defer atomic.AddInt32(totalWorkers, -1)
-	defer workersWg.Done()
-
-	for job := range jobs {
-		result := ScanResult{
-			IP:      job.IP,
-			Duration: 0,
-		}
-
-		addr := net.JoinHostPort(job.IP, "3389")
-		start := time.Now()
-		
-		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-		if err == nil {
-			defer conn.Close()
+	// Start consumers (workers)
+	for i := 0; i < config.Workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			defer workersTerminated.Add(1)
 			
-			conn.SetReadDeadline(time.Now().Add(time.Second))
-			
-			buf := make([]byte, 512)
-			n, err := conn.Read(buf)
-			if err == nil && n > 0 {
-				result.Open = true
-				result.Status = "OPEN"
-			} else if err == os.ErrDeadlineExceeded {
-				result.Open = false
-				result.Status = "TIMEOUT"
-			} else if n == 0 {
-				result.Open = true
-				result.Status = "OPEN"
-			} else {
-				result.Open = false
-				result.Status = "CLOSED"
+			for job := range jobChan {
+				result := ScanResult{
+					IP:      job.IP,
+					Duration: 0,
+				}
+
+				addr := net.JoinHostPort(job.IP, "3389")
+				start := time.Now()
+				
+				conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				if err == nil {
+					defer conn.Close()
+					
+					conn.SetReadDeadline(time.Now().Add(time.Second))
+					
+					buf := make([]byte, 512)
+					n, err := conn.Read(buf)
+					if err == nil && n > 0 {
+						result.Open = true
+						result.Status = "OPEN"
+					} else if err == os.ErrDeadlineExceeded {
+						result.Open = false
+						result.Status = "TIMEOUT"
+					} else if n == 0 {
+						result.Open = true
+						result.Status = "OPEN"
+					} else {
+						result.Open = false
+						result.Status = "CLOSED"
+					}
+				} else {
+					result.Open = false
+					result.Status = "TIMEOUT"
+				}
+
+				result.Duration = time.Since(start)
+				resultsChan <- result
 			}
-		} else {
-			result.Open = false
-			result.Status = "TIMEOUT"
-		}
-
-		result.Duration = time.Since(start)
-		
-		resultsMu.Lock()
-		results <- ResultItem{
-			ScanResult: result,
-			Index:      len(results),
-		}
-		atomic.AddInt64(finishedCount, 1)
-		resultsMu.Unlock()
+		}(i)
 	}
-}
 
-var workersWg sync.WaitGroup
+	// Collect results before waiting for workers
+	var scanResults []ScanResult
+	for result := range resultsChan {
+		scanResults = append(scanResults, result)
+	}
+
+	// Wait for all workers to finish the range loop
+	wg.Wait()
+
+	// Sort results by IP for consistency
+	sort.Slice(scanResults, func(i, j int) bool {
+		return scanResults[i].IP < scanResults[j].IP
+	})
+
+	// Return sorted results
+	return scanResults
+}
 
 func saveResults(results []ScanResult, filename string) error {
 	file, err := os.Create(filename)
